@@ -2,6 +2,8 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import re
+import asyncio
 
 import tiktoken
 
@@ -110,7 +112,13 @@ class OpenAIHelper:
         self.conversations: dict[int: list] = {}  # {chat_id: history}
         self.conversations_vision: dict[int: bool] = {}  # {chat_id: is_vision}
         self.last_updated: dict[int: datetime] = {}  # {chat_id: last_update_timestamp}
-
+        self.action_re = re.compile('^Action: (\w+): (.*)')
+        self.known_actions = {
+            "wikipedia": self.wikipedia,
+            "calculate": self.calculate,
+            # Add other actions as needed
+        }
+        
     def get_conversation_stats(self, chat_id: int) -> tuple[int, int]:
         """
         Gets the number of messages and tokens used in the conversation.
@@ -737,3 +745,60 @@ class OpenAIHelper:
     #     billing_data = json.loads(response.text)
     #     usage_month = billing_data["total_usage"] / 100  # convert cent amount to dollars
     #     return usage_month
+
+    async def wikipedia(self, q: str) -> str:
+        """Wikipedia search action"""
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "query",
+                    "list": "search",
+                    "srsearch": q,
+                    "format": "json"
+                }
+            )
+            data = response.json()
+            return data["query"]["search"][0]["snippet"]
+
+    def calculate(self, expression: str) -> str:
+        """Calculate action"""
+        try:
+            return str(eval(expression, {"__builtins__": {}}, {}))
+        except Exception as e:
+            return f"Error in calculation: {str(e)}"
+
+    async def get_chat_response_with_actions(self, chat_id: int, query: str, max_turns: int = 5) -> tuple[str, int]:
+        """
+        Gets a response from the model with support for actions.
+        Returns the final answer and total tokens used.
+        """
+        i = 0
+        next_prompt = query
+        total_tokens = 0
+        
+        while i < max_turns:
+            i += 1
+            response, tokens = await self.get_chat_response(chat_id, next_prompt)
+            total_tokens += int(tokens)
+            
+            # Look for actions in the response
+            actions = [self.action_re.match(a) for a in response.split('\n') if self.action_re.match(a)]
+            
+            if actions:
+                action, action_input = actions[0].groups()
+                if action not in self.known_actions:
+                    return f"Error: Unknown action: {action}", total_tokens
+                
+                try:
+                    observation = await self.known_actions[action](action_input) \
+                        if asyncio.iscoroutinefunction(self.known_actions[action]) \
+                        else self.known_actions[action](action_input)
+                    next_prompt = f"Observation: {observation}"
+                except Exception as e:
+                    return f"Error executing action {action}: {str(e)}", total_tokens
+            else:
+                # No more actions, return the final response
+                return response, total_tokens
+        
+        return "Max turns exceeded", total_tokens
